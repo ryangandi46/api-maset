@@ -1,153 +1,135 @@
-# Impor library yang diperlukan
+# app.py — API clustering (model baru, 2 endpoint)
+
 from flask import Flask, request, jsonify
 import joblib
 import numpy as np
+import pandas as pd
+import traceback
 
-# Inisialisasi aplikasi Flask
 app = Flask(__name__)
 
-# --- Muat bundle model dari satu file saat aplikasi pertama kali dijalankan ---
+# ---------------------------
+# Konfigurasi & konstanta
+# ---------------------------
+FEATURES = ['kalori', 'karbohidrat', 'protein', 'harga']   # urutan fitur numerik
+DATA_PATH = 'foodeat_cleaned.csv'                          # opsional, untuk hitung mean
+
+# ---------------------------
+# Muat model & siapkan data
+# ---------------------------
 try:
-    # Muat bundle yang berisi semua komponen model
-    model_bundle = joblib.load('model_rekomendasi_makanan.pkl')
-
-    # Ekstrak setiap komponen dari bundle ke variabel masing-masing
-    kmeans = model_bundle['kmeans']
-    scaler = model_bundle['scaler']
-    le_diet = model_bundle['label_encoder_diet']
-    le_level = model_bundle['label_encoder_level']
-    
-    # Catatan: Akan lebih baik jika nilai rata-rata ini juga disimpan di dalam bundle
-    # Untuk sekarang, kita definisikan secara manual sebagai placeholder
-    # Anda bisa mendapatkan nilai ini dari notebook saat training: df[['kalori', 'karbohidrat', 'protein']].mean()
-    avg_features = {
-        'kalori': 350.5,
-        'karbohidrat': 30.2,
-        'protein': 18.9
-    }
-    
-    print("✅ Model bundle (kmeans, scaler, encoders) berhasil dimuat.")
-
+    bundle = joblib.load('model_rekomendasi_makanan.pkl')
+    kmeans = bundle['kmeans']
+    scaler = bundle['scaler']
+    # Validasi urutan fitur jika disimpan
+    if 'features' in bundle:
+        if list(bundle['features']) != FEATURES:
+            print(f"⚠️  Peringatan: Urutan FEATURES di bundle {bundle['features']} "
+                  f"berbeda dengan API {FEATURES}. Pastikan konsisten!")
+    print("✅ Model (kmeans, scaler) berhasil dimuat.")
 except FileNotFoundError:
-    print("❌ FATAL ERROR: File 'model_rekomendasi_makanan.pkl' tidak ditemukan.")
-    print("Pastikan file model berada di folder yang sama dengan app.py")
-    exit() # Hentikan aplikasi jika file model tidak ada
+    raise SystemExit("❌ 'model_rekomendasi_makanan.pkl' tidak ditemukan.")
 except KeyError as e:
-    print(f"❌ FATAL ERROR: Komponen '{e}' tidak ditemukan di dalam bundle model.")
-    exit()
-# -------------------------------------------------------------------------
+    raise SystemExit(f"❌ Kunci '{e}' tidak ada dalam bundle model.")
 
+# Hitung rata-rata nutrisi dari data (untuk profil user di /get-user-cluster)
+try:
+    df_ref = pd.read_csv(DATA_PATH)
+    for col in FEATURES:
+        if col not in df_ref.columns:
+            raise KeyError(f"Kolom '{col}' tidak ada di {DATA_PATH}")
+    means = df_ref[FEATURES].mean(numeric_only=True)
+    print("✅ Rata-rata nutrisi dari data referensi berhasil dihitung.")
+except Exception as e:
+    print(f"⚠️  Tidak bisa memuat '{DATA_PATH}' atau kolom tidak lengkap ({e}). "
+          "Pakai fallback mean sederhana.")
+    means = pd.Series(
+        {'kalori': 350.0, 'karbohidrat': 30.0, 'protein': 20.0, 'harga': 25000.0}
+    )
 
+# ---------------------------
+# Utilitas kecil
+# ---------------------------
+def derive_level_harga(harga: float) -> str:
+    if harga < 18000:
+        return 'Normal'
+    elif harga <= 35000:
+        return 'Mahal'
+    return 'Premium'
+
+def to_float(v, name):
+    try:
+        return float(v)
+    except Exception:
+        raise ValueError(f"'{name}' harus numerik.")
+
+# ---------------------------
+# Routes
+# ---------------------------
 @app.route('/')
 def index():
-    return "API Model Rekomendasi Makanan Aktif."
+    return "API Clustering Makanan (model baru, 2 endpoint) aktif."
 
-
-# Endpoint #1: Mendapatkan CLUSTER REKOMENDASI untuk PENGGUNA
-@app.route('/get-user-cluster', methods=['POST'])
-def get_user_cluster():
-    """
-    Menerima budget dan tipe diet, lalu mengembalikan nomor cluster yang paling cocok.
-    """
-    try:
-        # Ambil data JSON yang dikirim dari client (Laravel)
-        data = request.get_json()
-
-        # Validasi input
-        if not data or 'budget' not in data or 'tipe_diet' not in data:
-            return jsonify({'error': 'Input tidak valid! Pastikan ada key "budget" dan "tipe_diet".'}), 400
-
-        budget_user = int(data['budget'])
-        tipe_diet_user = data['tipe_diet']
-
-        # --- Logika untuk membuat profil pengguna ---
-        # 1. Ubah input teks menjadi angka (encoded)
-        diet_encoded = le_diet.transform([tipe_diet_user])[0]
-
-        # 2. Tentukan level harga dari budget
-        if budget_user < 18000:
-            level_harga = 'Normal'
-        elif 18000 <= budget_user <= 35000:
-            level_harga = 'Mahal'
-        else:
-            level_harga = 'Premium'
-        
-        level_encoded = le_level.transform([level_harga])[0]
-
-        # 3. Buat array fitur untuk diprediksi
-        # Gunakan nilai rata-rata dari data training sebagai placeholder
-        input_user = [[
-            avg_features['kalori'],
-            avg_features['karbohidrat'],
-            avg_features['protein'],
-            budget_user,
-            diet_encoded,
-            level_encoded
-        ]]
-
-        # 4. Scaling input
-        input_user_scaled = scaler.transform(input_user)
-
-        # 5. Prediksi cluster
-        predicted_cluster = kmeans.predict(input_user_scaled)[0]
-
-        # Kembalikan hasil dalam format JSON
-        return jsonify({'cluster': int(predicted_cluster)})
-
-    except ValueError:
-        return jsonify({'error': f"Tipe diet '{tipe_diet_user}' tidak dikenali oleh model."}), 400
-    except Exception as e:
-        return jsonify({'error': f'Terjadi kesalahan internal: {str(e)}'}), 500
-
-
-# Endpoint #2: Memprediksi CLUSTER untuk MAKANAN BARU
 @app.route('/predict-food-cluster', methods=['POST'])
 def predict_food_cluster():
     """
-    Menerima fitur-fitur dari satu makanan, lalu mengembalikan nomor cluster untuk makanan tsb.
+    Input JSON: { kalori, karbohidrat, protein, harga }
+    Output: { cluster, level_harga }
     """
     try:
-        data = request.get_json()
+        data = request.get_json(force=True)
+        req_keys = ['kalori', 'karbohidrat', 'protein', 'harga']
+        if not all(k in data for k in req_keys):
+            return jsonify({'error': f'Key wajib: {req_keys}'}), 400
 
-        # Validasi input
-        required_keys = ['kalori', 'karbohidrat', 'protein', 'harga', 'tipe_diet']
-        if not all(key in data for key in required_keys):
-            return jsonify({'error': f'Input tidak valid! Key yang dibutuhkan: {required_keys}.'}), 400
+        kal = to_float(data['kalori'], 'kalori')
+        kar = to_float(data['karbohidrat'], 'karbohidrat')
+        pro = to_float(data['protein'], 'protein')
+        har = to_float(data['harga'], 'harga')
 
-        # Tentukan level harga berdasarkan harga makanan
-        if data['harga'] < 18000: level_harga = 'Normal'
-        elif data['harga'] <= 35000: level_harga = 'Mahal'
-        else: level_harga = 'Premium'
-            
-        # Ubah input teks menjadi angka
-        diet_encoded = le_diet.transform([data['tipe_diet']])[0]
-        level_encoded = le_level.transform([level_harga])[0]
+        X = [[kal, kar, pro, har]]
+        Xs = scaler.transform(X)
+        cluster_id = int(kmeans.predict(Xs)[0])
+        level_harga = derive_level_harga(har)
 
-        # Buat array fitur dari data makanan baru
-        food_features = [[
-            data['kalori'],
-            data['karbohidrat'],
-            data['protein'],
-            data['harga'],
-            diet_encoded,
-            level_encoded
-        ]]
+        return jsonify({'cluster': cluster_id, 'level_harga': level_harga})
 
-        # Scaling fitur
-        food_features_scaled = scaler.transform(food_features)
-
-        # Prediksi cluster
-        predicted_cluster = kmeans.predict(food_features_scaled)[0]
-
-        return jsonify({'cluster': int(predicted_cluster)})
-
-    except ValueError:
-         return jsonify({'error': f"Tipe diet '{data.get('tipe_diet')}' tidak dikenali oleh model."}), 400
     except Exception as e:
-        return jsonify({'error': f'Terjadi kesalahan internal: {str(e)}'}), 500
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
 
+@app.route('/get-user-cluster', methods=['POST'])
+def get_user_cluster():
+    """
+    Input JSON: { budget, tipe_diet }
+      - 'tipe_diet' diterima agar bisa dipakai di layer aplikasi (Laravel), TIDAK dipakai ke model.
+    Output: { cluster, level_harga }
+    """
+    try:
+        data = request.get_json(force=True)
+        if 'budget' not in data:
+            return jsonify({'error': 'Key "budget" wajib ada.'}), 400
 
+        budget = to_float(data['budget'], 'budget')
+
+        # Profil user sederhana: pakai mean nutrisi dari data + budget user
+        in_vec = [[
+            float(data.get('kalori', means['kalori'])),
+            float(data.get('karbohidrat', means['karbohidrat'])),
+            float(data.get('protein', means['protein'])),
+            budget
+        ]]
+        Xs = scaler.transform(in_vec)
+        cluster_id = int(kmeans.predict(Xs)[0])
+        level_harga = derive_level_harga(budget)
+
+        return jsonify({'cluster': cluster_id, 'level_harga': level_harga})
+
+    except Exception as e:
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+
+# ---------------------------
+# Main
+# ---------------------------
 if __name__ == '__main__':
-    # Jalankan aplikasi. Port 5000 adalah default.
-    # host='0.0.0.0' agar bisa diakses dari luar container Docker (jika digunakan)
+    # host='0.0.0.0' agar bisa diakses lintas host/container
     app.run(host='0.0.0.0', port=5000, debug=True)
